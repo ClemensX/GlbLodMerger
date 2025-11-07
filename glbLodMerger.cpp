@@ -378,6 +378,160 @@ void validityCheck(MeshImportData& import, const tinygltf::Model& srcModel, int 
     }
 }
 
+void createLodMesh(tinygltf::Model& ioModel,
+                   tinygltf::Mesh& outMesh,
+                   const MeshImportData& lodMeshData,
+                   int baseMeshIndex = 0,
+                   int basePrimIndex = 0)
+{
+    outMesh.name = "LOD_Mesh";
+
+    // Validate base mesh/primitive
+    if (baseMeshIndex < 0 || baseMeshIndex >= static_cast<int>(ioModel.meshes.size())) {
+        Log("createLodMesh: baseMeshIndex out of range\n");
+        return;
+    }
+    const tinygltf::Mesh& baseMesh = ioModel.meshes[baseMeshIndex];
+    if (basePrimIndex < 0 || basePrimIndex >= static_cast<int>(baseMesh.primitives.size())) {
+        Log("createLodMesh: basePrimIndex out of range\n");
+        return;
+    }
+    const tinygltf::Primitive& basePrim = baseMesh.primitives[basePrimIndex];
+
+    // Find the base POSITION accessor index (required)
+    auto posIt = basePrim.attributes.find("POSITION");
+    if (posIt == basePrim.attributes.end()) {
+        Log("createLodMesh: base primitive has no POSITION attribute\n");
+        return;
+    }
+    const int basePosAccessorIndex = posIt->second;
+
+    // Optionally reuse other attributes if present (NORMAL, TEXCOORD_0)
+    const auto normIt = basePrim.attributes.find("NORMAL");
+    const auto uv0It  = basePrim.attributes.find("TEXCOORD_0");
+
+    // Prepare the index buffer contents from LOD
+    if (lodMeshData.indicesStride != 1 &&
+        lodMeshData.indicesStride != 2 &&
+        lodMeshData.indicesStride != 4) {
+        Log("createLodMesh: unsupported indices stride " << lodMeshData.indicesStride << "\n");
+        return;
+    }
+    const size_t indexCount = lodMeshData.indices.size() / static_cast<size_t>(lodMeshData.indicesStride);
+    if (indexCount == 0) {
+        Log("createLodMesh: LOD indices are empty\n");
+        return;
+    }
+
+    // Map stride to glTF componentType
+    int indexComponentType = -1;
+    switch (lodMeshData.indicesStride) {
+        case 1: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE; break;
+        case 2: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT; break;
+        case 4: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT; break;
+    }
+
+    // Append a new buffer with index data
+    tinygltf::Buffer idxBuffer;
+    idxBuffer.data = lodMeshData.indices; // copy indices once into the model (required by glTF)
+    const int idxBufferIndex = static_cast<int>(ioModel.buffers.size());
+    ioModel.buffers.push_back(std::move(idxBuffer));
+
+    // Append a bufferView for the index buffer
+    tinygltf::BufferView idxBV;
+    idxBV.name = "LOD_Indices";
+    idxBV.buffer = idxBufferIndex;
+    idxBV.byteOffset = 0;
+    idxBV.byteLength = lodMeshData.indices.size();
+    idxBV.byteStride = 0; // tightly packed indices
+    idxBV.target = 34963; // ELEMENT_ARRAY_BUFFER
+    const int idxBVIndex = static_cast<int>(ioModel.bufferViews.size());
+    ioModel.bufferViews.push_back(std::move(idxBV));
+
+    // Build an accessor for the indices
+    tinygltf::Accessor idxAccessor;
+    idxAccessor.name = "LOD_IndicesAccessor";
+    idxAccessor.bufferView = idxBVIndex;
+    idxAccessor.byteOffset = 0;
+    idxAccessor.componentType = indexComponentType;
+    idxAccessor.count = indexCount;
+    idxAccessor.type = TINYGLTF_TYPE_SCALAR;
+    idxAccessor.normalized = false;
+
+    // Fill min/max for the indices (optional but nice to have)
+    uint64_t minIdx = std::numeric_limits<uint64_t>::max();
+    uint64_t maxIdx = 0;
+    for (size_t i = 0; i < indexCount; ++i) {
+        uint32_t v = ReadIndexAt(lodMeshData.indices, lodMeshData.indicesStride, i);
+        if (v < minIdx) minIdx = v;
+        if (v > maxIdx) maxIdx = v;
+    }
+    idxAccessor.minValues = { static_cast<double>(minIdx) };
+    idxAccessor.maxValues = { static_cast<double>(maxIdx) };
+
+    const int idxAccessorIndex = static_cast<int>(ioModel.accessors.size());
+    ioModel.accessors.push_back(std::move(idxAccessor));
+
+    // Assemble the new primitive:
+    // - Reuse POSITION (and optionally NORMAL, TEXCOORD_0) from the base primitive.
+    // - Point indices to the new accessor.
+    tinygltf::Primitive prim;
+    prim.mode = TINYGLTF_MODE_TRIANGLES; // assuming triangles; adjust if needed
+    prim.indices = idxAccessorIndex;
+    prim.attributes["POSITION"] = basePosAccessorIndex;
+    if (normIt != basePrim.attributes.end()) {
+        prim.attributes["NORMAL"] = normIt->second;
+    }
+    if (uv0It != basePrim.attributes.end()) {
+        prim.attributes["TEXCOORD_0"] = uv0It->second;
+    }
+    // Reuse material if base has one.
+    prim.material = basePrim.material;
+
+    outMesh.primitives.push_back(std::move(prim));
+}
+
+static void AttachLodsUnderBaseNodes(tinygltf::Model& model,
+                                     const std::vector<int>& lodMeshIndices,
+                                     int baseMeshIndex,
+                                     const std::string& baseName)
+{
+    if (lodMeshIndices.empty()) return;
+
+    // Find nodes that reference the base mesh.
+    std::vector<int> baseNodeIndices;
+    for (int ni = 0; ni < static_cast<int>(model.nodes.size()); ++ni) {
+        if (model.nodes[ni].mesh == baseMeshIndex) {
+            baseNodeIndices.push_back(ni);
+        }
+    }
+
+    if (baseNodeIndices.empty()) {
+        Log("WARNING: No node references base mesh " << baseMeshIndex
+            << ". Cannot attach LODs under base transform; keeping prior layout.\n");
+        return;
+    }
+
+    for (int baseNodeIdx : baseNodeIndices) {
+        // Create a LOD group under the base node (inherits base transform).
+        tinygltf::Node lodGroup;
+        lodGroup.name = baseName + "_LODs";
+        const int lodGroupIndex = static_cast<int>(model.nodes.size());
+        model.nodes.push_back(lodGroup);
+        model.nodes[baseNodeIdx].children.push_back(lodGroupIndex);
+
+        // Create one child per LOD mesh, identity TRS (inherit parent's transform).
+        for (size_t k = 0; k < lodMeshIndices.size(); ++k) {
+            tinygltf::Node child;
+            child.mesh = lodMeshIndices[k];
+            child.name = baseName + "_LOD_" + std::to_string(k);
+            const int childIndex = static_cast<int>(model.nodes.size());
+            model.nodes.push_back(child);
+            model.nodes[lodGroupIndex].children.push_back(childIndex);
+        }
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -425,97 +579,20 @@ int main(int argc, char** argv)
             MeshImportData lodMeshData;
             importMesh(lodMeshData, lodModel, meshNum);
             validityCheck(lodMeshData, lodModel, meshNum);
-        }
-        for (auto& mesh : lodModel.meshes) {
-            tinygltf::Mesh newMesh = mesh;
-        /*    for (auto& prim : newMesh.primitives) {
-                // Copy indices accessor
-                if (prim.indices >= 0) {
-                    // Copy accessor
-                    tinygltf::Accessor accessor = lodModel.accessors[prim.indices];
-                    // Copy bufferView
-                    int oldBufferViewIdx = accessor.bufferView;
-                    tinygltf::BufferView bufferView = lodModel.bufferViews[oldBufferViewIdx];
-                    // Copy buffer
-                    int oldBufferIdx = bufferView.buffer;
-                    tinygltf::Buffer buffer = lodModel.buffers[oldBufferIdx];
-
-                    // Append buffer data
-                    int newBufferIdx = int(baseModel.buffers.size());
-                    baseModel.buffers.push_back(buffer);
-
-                    // Update bufferView to point to new buffer
-                    bufferView.buffer = newBufferIdx;
-                    int newBufferViewIdx = int(baseModel.bufferViews.size());
-                    baseModel.bufferViews.push_back(bufferView);
-
-                    // Update accessor to point to new bufferView
-                    accessor.bufferView = newBufferViewIdx;
-                    int newAccessorIdx = int(baseModel.accessors.size());
-                    baseModel.accessors.push_back(accessor);
-
-                    // Update primitive to point to new accessor
-                    prim.indices = newAccessorIdx;
-                }
-
-                // NOTE: If your LOD files have different vertex data, you must also copy attributes.
-                // The following was intentionally left out in your current code. Uncomment and use if needed.
-                // for (auto& attr : prim.attributes) {
-                //     int attrAccessorIdx = attr.second;
-                //     tinygltf::Accessor accessor = lodModel.accessors[attrAccessorIdx];
-                //     int oldBufferViewIdx = accessor.bufferView;
-                //     tinygltf::BufferView bufferView = lodModel.bufferViews[oldBufferViewIdx];
-                //     int oldBufferIdx = bufferView.buffer;
-                //     tinygltf::Buffer buffer = lodModel.buffers[oldBufferIdx];
-                //     int newBufferIdx = int(baseModel.buffers.size());
-                //     baseModel.buffers.push_back(buffer);
-                //     bufferView.buffer = newBufferIdx;
-                //     int newBufferViewIdx = int(baseModel.bufferViews.size());
-                //     baseModel.bufferViews.push_back(bufferView);
-                //     accessor.bufferView = newBufferViewIdx;
-                //     int newAccessorIdx = int(baseModel.accessors.size());
-                //     baseModel.accessors.push_back(accessor);
-                //     attr.second = newAccessorIdx;
-                // }
+            tinygltf::Mesh newLodMesh;
+            createLodMesh(baseModel, newLodMesh, lodMeshData, /*baseMeshIndex=*/0, /*basePrimIndex=*/0);
+            if (!newLodMesh.primitives.empty()) {
+                baseModel.meshes.push_back(newLodMesh);
+                newMeshIndices.push_back(static_cast<int>(baseModel.meshes.size() - 1));
             }
-            baseModel.meshes.push_back(newMesh);
-            newMeshIndices.push_back(int(baseModel.meshes.size() - 1));
-        */
         }
         
     }
 
-    // Create a parent node for all newly added meshes and attach it to the scene
+    // Attach LOD meshes under the base mesh node(s) so transforms match.
     if (!newMeshIndices.empty()) {
-        // Determine target scene
-        int sceneIndex = baseModel.defaultScene >= 0
-            ? baseModel.defaultScene
-            : (!baseModel.scenes.empty() ? 0 : -1);
-
-        if (sceneIndex == -1) {
-            tinygltf::Scene sc;
-            sc.name = "Scene";
-            sceneIndex = int(baseModel.scenes.size());
-            baseModel.scenes.push_back(sc);
-            baseModel.defaultScene = sceneIndex;
-        }
-
-        // Create LOD root node
-        tinygltf::Node lodRoot;
-        lodRoot.name = baseName + "_LODs";
-        int lodRootIndex = int(baseModel.nodes.size());
-        baseModel.nodes.push_back(lodRoot);
-        baseModel.scenes[sceneIndex].nodes.push_back(lodRootIndex);
-
-        // Create a child node per new mesh
-        for (size_t k = 0; k < newMeshIndices.size(); ++k) {
-            tinygltf::Node child;
-            child.mesh = newMeshIndices[k];
-            child.name = baseName + "_LOD_" + std::to_string(k);
-            int childIndex = int(baseModel.nodes.size());
-            baseModel.nodes.push_back(child);
-            baseModel.nodes[lodRootIndex].children.push_back(childIndex);
-        }
+        const int baseMeshIndex = 0; // adjust if your base mesh index differs
+        AttachLodsUnderBaseNodes(baseModel, newMeshIndices, baseMeshIndex, baseName);
     }
 
     // Write merged GLB
