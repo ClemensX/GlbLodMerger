@@ -57,6 +57,83 @@ do { \
 using namespace std;
 using namespace glm;
 
+void extractVertexAttribute(const tinygltf::Model& model, const tinygltf::Primitive& primitive, const std::string& attributeName, std::vector<float>& outData, int& stride,
+    std::vector<double>& min, std::vector<double>& max) {
+    auto it = primitive.attributes.find(attributeName);
+    if (it != primitive.attributes.end()) {
+        const tinygltf::Accessor& accessor = model.accessors[it->second];
+        const tinygltf::BufferView& bufferView = model.bufferViews[accessor.bufferView];
+        const float* bufferData = reinterpret_cast<const float*>(&(model.buffers[bufferView.buffer].data[accessor.byteOffset + bufferView.byteOffset]));
+        stride = accessor.ByteStride(bufferView) ? (accessor.ByteStride(bufferView) / sizeof(float)) : tinygltf::GetNumComponentsInType(accessor.type);
+        outData.assign(bufferData, bufferData + accessor.count * stride);
+        for (double minVal : accessor.minValues) {
+            min.push_back(minVal);
+        }
+        for (double maxVal : accessor.maxValues) {
+            max.push_back(maxVal);
+        }
+    }
+}
+
+void extractIndexAttribute(const tinygltf::Model& model, const tinygltf::Primitive& primitive, std::vector<unsigned char>& outData, int& stride,
+    std::vector<double>& min, std::vector<double>& max,
+    tinygltf::Accessor& accessorOut, tinygltf::BufferView& bufferViewOut) {
+    auto& accessor = model.accessors[primitive.indices];
+    auto& bufferView = model.bufferViews[accessor.bufferView];
+    const unsigned char* bufferData = reinterpret_cast<const unsigned char*>(&(model.buffers[bufferView.buffer].data[accessor.byteOffset + bufferView.byteOffset]));
+    outData.assign(bufferData, bufferData + accessor.count * 4);
+    for (double minVal : accessor.minValues) {
+        min.push_back(minVal);
+    }
+    for (double maxVal : accessor.maxValues) {
+        max.push_back(maxVal);
+    }
+    bufferViewOut.target = bufferView.target;
+    accessorOut.componentType = accessor.componentType;
+    accessorOut.count = accessor.count;
+    accessorOut.type = accessor.type;
+}
+
+void importMesh(tinygltf::Model& destModel, const tinygltf::Model& srcModel, int meshIndex)
+{
+    const tinygltf::Mesh& srcMesh = srcModel.meshes[meshIndex];
+
+    auto& primMesh = srcMesh.primitives[0];
+    // Extract positions
+    std::vector<float> positions;
+    std::vector<double> posMin;
+    std::vector<double> posMax;
+    int posStrideMesh;
+    extractVertexAttribute(srcModel, primMesh, "POSITION", positions, posStrideMesh, posMin, posMax);
+    Log(" imported mesh buffer positions: " << positions.size() / posStrideMesh << std::endl);
+
+    // Extract normals
+    std::vector<float> normals;
+    std::vector<double> normalMin;
+    std::vector<double> normalMax;
+    int normalStride;
+    extractVertexAttribute(srcModel, primMesh, "NORMAL", normals, normalStride, normalMin, normalMax);
+    Log(" imported mesh buffer normals: " << normals.size() / normalStride << std::endl);
+    // Extract texture coordinates
+    std::vector<float> texCoords;
+    std::vector<double> texMin;
+    std::vector<double> texMax;
+    int texCoordStride;
+    extractVertexAttribute(srcModel, primMesh, "TEXCOORD_0", texCoords, texCoordStride, texMin, texMax);
+    Log(" imported mesh buffer tex 0: " << texCoords.size() / texCoordStride << std::endl);
+
+    // indices
+    tinygltf::Accessor indicesAccessor;
+    tinygltf::BufferView indicesBufferView;
+    // Extract normals
+    std::vector<unsigned char> indices; // typeless buffer
+    std::vector<double> indicesMin;
+    std::vector<double> indicesMax;
+    int indicesStride;
+    extractIndexAttribute(srcModel, primMesh, indices, indicesStride, indicesMin, indicesMax, indicesAccessor, indicesBufferView);
+    Log(" imported mesh buffer indices: " << indices.size() / 4 << std::endl);
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -97,9 +174,12 @@ int main(int argc, char** argv)
         }
 
         // Merge meshes from LOD model into base model
+        for (int meshNum = 0; meshNum < int(lodModel.meshes.size()); ++meshNum) {
+            importMesh(baseModel, lodModel, meshNum);
+        }
         for (auto& mesh : lodModel.meshes) {
             tinygltf::Mesh newMesh = mesh;
-            for (auto& prim : newMesh.primitives) {
+        /*    for (auto& prim : newMesh.primitives) {
                 // Copy indices accessor
                 if (prim.indices >= 0) {
                     // Copy accessor
@@ -151,7 +231,9 @@ int main(int argc, char** argv)
             }
             baseModel.meshes.push_back(newMesh);
             newMeshIndices.push_back(int(baseModel.meshes.size() - 1));
+        */
         }
+        
     }
 
     // Create a parent node for all newly added meshes and attach it to the scene
