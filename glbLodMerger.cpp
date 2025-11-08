@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <cstring>
 
 // GLM helpers for TRS/matrices
 #include <glm/gtc/matrix_transform.hpp>
@@ -384,33 +385,77 @@ void createLodMesh(tinygltf::Model& ioModel,
                    int baseMeshIndex = 0,
                    int basePrimIndex = 0)
 {
+    outMesh = tinygltf::Mesh();
     outMesh.name = "LOD_Mesh";
 
-    // Validate base mesh/primitive
-    if (baseMeshIndex < 0 || baseMeshIndex >= static_cast<int>(ioModel.meshes.size())) {
-        Log("createLodMesh: baseMeshIndex out of range\n");
+    // Validate there is position data
+    if (lodMeshData.posStride <= 0 || lodMeshData.positions.empty()) {
+        Log("createLodMesh: LOD has no POSITION data\n");
         return;
     }
-    const tinygltf::Mesh& baseMesh = ioModel.meshes[baseMeshIndex];
-    if (basePrimIndex < 0 || basePrimIndex >= static_cast<int>(baseMesh.primitives.size())) {
-        Log("createLodMesh: basePrimIndex out of range\n");
-        return;
+
+    // We optionally reuse base material for visual parity.
+    int reuseMaterial = -1;
+    if (baseMeshIndex >= 0 && baseMeshIndex < static_cast<int>(ioModel.meshes.size())) {
+        const tinygltf::Mesh& baseMesh = ioModel.meshes[baseMeshIndex];
+        if (basePrimIndex >= 0 && basePrimIndex < static_cast<int>(baseMesh.primitives.size())) {
+            reuseMaterial = baseMesh.primitives[basePrimIndex].material;
+        }
     }
-    const tinygltf::Primitive& basePrim = baseMesh.primitives[basePrimIndex];
 
-    // Find the base POSITION accessor index (required)
-    auto posIt = basePrim.attributes.find("POSITION");
-    if (posIt == basePrim.attributes.end()) {
-        Log("createLodMesh: base primitive has no POSITION attribute\n");
-        return;
+    // Prepare a single buffer and pack: positions [ + normals ] [ + uvs ] + indices (aligned to 4 bytes).
+    auto align4 = [](size_t v) -> size_t { return (v + 3u) & ~size_t(3u); };
+
+    std::vector<unsigned char> bin;
+    bin.reserve(
+        lodMeshData.positions.size() * sizeof(float) +
+        lodMeshData.normals.size()   * sizeof(float) +
+        lodMeshData.texCoords.size() * sizeof(float) +
+        lodMeshData.indices.size() + 16);
+
+    // Write positions (float)
+    size_t posOffset = align4(bin.size());
+    bin.resize(posOffset);
+    {
+        const unsigned char* src = reinterpret_cast<const unsigned char*>(lodMeshData.positions.data());
+        bin.insert(bin.end(), src, src + lodMeshData.positions.size() * sizeof(float));
     }
-    const int basePosAccessorIndex = posIt->second;
+    const size_t posByteLength = lodMeshData.positions.size() * sizeof(float);
 
-    // Optionally reuse other attributes if present (NORMAL, TEXCOORD_0)
-    const auto normIt = basePrim.attributes.find("NORMAL");
-    const auto uv0It  = basePrim.attributes.find("TEXCOORD_0");
+    // Optionally write normals if count matches positions
+    const size_t posCount = lodMeshData.positions.size() / static_cast<size_t>(lodMeshData.posStride);
+    int normalAccessorIndex = -1;
+    size_t normalOffset = 0, normalByteLength = 0;
+    if (lodMeshData.normalStride > 0 && !lodMeshData.normals.empty()) {
+        const size_t normalCount = lodMeshData.normals.size() / static_cast<size_t>(lodMeshData.normalStride);
+        if (normalCount == posCount && lodMeshData.normalStride == 3) {
+            normalOffset = align4(bin.size());
+            bin.resize(normalOffset);
+            const unsigned char* src = reinterpret_cast<const unsigned char*>(lodMeshData.normals.data());
+            bin.insert(bin.end(), src, src + lodMeshData.normals.size() * sizeof(float));
+            normalByteLength = lodMeshData.normals.size() * sizeof(float);
+        } else {
+            Log("createLodMesh: Skipping NORMALS (count/stride mismatch)\n");
+        }
+    }
 
-    // Prepare the index buffer contents from LOD
+    // Optionally write UV0 if count matches positions
+    int uv0AccessorIndex = -1;
+    size_t uv0Offset = 0, uv0ByteLength = 0;
+    if (lodMeshData.texCoordStride > 0 && !lodMeshData.texCoords.empty()) {
+        const size_t uvCount = lodMeshData.texCoords.size() / static_cast<size_t>(lodMeshData.texCoordStride);
+        if (uvCount == posCount && (lodMeshData.texCoordStride == 2 || lodMeshData.texCoordStride == 3)) {
+            uv0Offset = align4(bin.size());
+            bin.resize(uv0Offset);
+            const unsigned char* src = reinterpret_cast<const unsigned char*>(lodMeshData.texCoords.data());
+            bin.insert(bin.end(), src, src + lodMeshData.texCoords.size() * sizeof(float));
+            uv0ByteLength = lodMeshData.texCoords.size() * sizeof(float);
+        } else {
+            Log("createLodMesh: Skipping TEXCOORD_0 (count/stride mismatch)\n");
+        }
+    }
+
+    // Write indices (typeless buffer already correctly packed with stride 1/2/4)
     if (lodMeshData.indicesStride != 1 &&
         lodMeshData.indicesStride != 2 &&
         lodMeshData.indicesStride != 4) {
@@ -422,71 +467,160 @@ void createLodMesh(tinygltf::Model& ioModel,
         Log("createLodMesh: LOD indices are empty\n");
         return;
     }
+    size_t idxOffset = align4(bin.size());
+    bin.resize(idxOffset);
+    bin.insert(bin.end(), lodMeshData.indices.begin(), lodMeshData.indices.end());
+    const size_t idxByteLength = lodMeshData.indices.size();
 
-    // Map stride to glTF componentType
-    int indexComponentType = -1;
-    switch (lodMeshData.indicesStride) {
-        case 1: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE; break;
-        case 2: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT; break;
-        case 4: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT; break;
+    // Create one buffer for all data
+    tinygltf::Buffer buffer;
+    buffer.data = std::move(bin);
+    const int bufferIndex = static_cast<int>(ioModel.buffers.size());
+    ioModel.buffers.push_back(std::move(buffer));
+
+    // Create BufferViews
+    // Positions
+    tinygltf::BufferView posBV;
+    posBV.name = "LOD_Positions";
+    posBV.buffer = bufferIndex;
+    posBV.byteOffset = posOffset;
+    posBV.byteLength = posByteLength;
+    posBV.byteStride = 0; // tightly packed float[N]
+    posBV.target = 34962; // ARRAY_BUFFER
+    const int posBVIndex = static_cast<int>(ioModel.bufferViews.size());
+    ioModel.bufferViews.push_back(std::move(posBV));
+
+    // Normals (optional)
+    int normalBVIndex = -1;
+    if (normalByteLength > 0) {
+        tinygltf::BufferView bv;
+        bv.name = "LOD_Normals";
+        bv.buffer = bufferIndex;
+        bv.byteOffset = normalOffset;
+        bv.byteLength = normalByteLength;
+        bv.byteStride = 0;
+        bv.target = 34962; // ARRAY_BUFFER
+        normalBVIndex = static_cast<int>(ioModel.bufferViews.size());
+        ioModel.bufferViews.push_back(std::move(bv));
     }
 
-    // Append a new buffer with index data
-    tinygltf::Buffer idxBuffer;
-    idxBuffer.data = lodMeshData.indices; // copy indices once into the model (required by glTF)
-    const int idxBufferIndex = static_cast<int>(ioModel.buffers.size());
-    ioModel.buffers.push_back(std::move(idxBuffer));
+    // UV0 (optional)
+    int uv0BVIndex = -1;
+    if (uv0ByteLength > 0) {
+        tinygltf::BufferView bv;
+        bv.name = "LOD_Texcoord0";
+        bv.buffer = bufferIndex;
+        bv.byteOffset = uv0Offset;
+        bv.byteLength = uv0ByteLength;
+        bv.byteStride = 0;
+        bv.target = 34962; // ARRAY_BUFFER
+        uv0BVIndex = static_cast<int>(ioModel.bufferViews.size());
+        ioModel.bufferViews.push_back(std::move(bv));
+    }
 
-    // Append a bufferView for the index buffer
+    // Indices
     tinygltf::BufferView idxBV;
     idxBV.name = "LOD_Indices";
-    idxBV.buffer = idxBufferIndex;
-    idxBV.byteOffset = 0;
-    idxBV.byteLength = lodMeshData.indices.size();
-    idxBV.byteStride = 0; // tightly packed indices
+    idxBV.buffer = bufferIndex;
+    idxBV.byteOffset = idxOffset;
+    idxBV.byteLength = idxByteLength;
+    idxBV.byteStride = 0; // tightly packed
     idxBV.target = 34963; // ELEMENT_ARRAY_BUFFER
     const int idxBVIndex = static_cast<int>(ioModel.bufferViews.size());
     ioModel.bufferViews.push_back(std::move(idxBV));
 
-    // Build an accessor for the indices
+    // Accessors
+    // Positions
+    tinygltf::Accessor posAccessor;
+    posAccessor.name = "LOD_PositionAccessor";
+    posAccessor.bufferView = posBVIndex;
+    posAccessor.byteOffset = 0;
+    posAccessor.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+    posAccessor.count = posCount;
+    posAccessor.type = (lodMeshData.posStride == 2) ? TINYGLTF_TYPE_VEC2
+                     : (lodMeshData.posStride == 4) ? TINYGLTF_TYPE_VEC4
+                     : TINYGLTF_TYPE_VEC3; // default
+    posAccessor.normalized = false;
+    if (lodMeshData.posMin.size() >= static_cast<size_t>(lodMeshData.posStride) &&
+        lodMeshData.posMax.size() >= static_cast<size_t>(lodMeshData.posStride)) {
+        posAccessor.minValues.assign(lodMeshData.posMin.begin(),
+                                     lodMeshData.posMin.begin() + lodMeshData.posStride);
+        posAccessor.maxValues.assign(lodMeshData.posMax.begin(),
+                                     lodMeshData.posMax.begin() + lodMeshData.posStride);
+    }
+    const int posAccessorIndex = static_cast<int>(ioModel.accessors.size());
+    ioModel.accessors.push_back(std::move(posAccessor));
+
+    // Normals (optional, only if present and valid)
+    if (normalByteLength > 0) {
+        tinygltf::Accessor n;
+        n.name = "LOD_NormalAccessor";
+        n.bufferView = normalBVIndex;
+        n.byteOffset = 0;
+        n.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+        n.count = posCount; // matched above
+        n.type = TINYGLTF_TYPE_VEC3;
+        n.normalized = false;
+        normalAccessorIndex = static_cast<int>(ioModel.accessors.size());
+        ioModel.accessors.push_back(std::move(n));
+    }
+
+    // UV0 (optional, only if present and valid)
+    if (uv0ByteLength > 0) {
+        tinygltf::Accessor uv;
+        uv.name = "LOD_UV0Accessor";
+        uv.bufferView = uv0BVIndex;
+        uv.byteOffset = 0;
+        uv.componentType = TINYGLTF_COMPONENT_TYPE_FLOAT;
+        uv.count = posCount; // matched above
+        uv.type = (lodMeshData.texCoordStride == 3) ? TINYGLTF_TYPE_VEC3 : TINYGLTF_TYPE_VEC2;
+        uv.normalized = false;
+        uv0AccessorIndex = static_cast<int>(ioModel.accessors.size());
+        ioModel.accessors.push_back(std::move(uv));
+    }
+
+    // Indices
+    int indexComponentType = -1;
+    switch (lodMeshData.indicesStride) {
+        case 1: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE;  break;
+        case 2: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT; break;
+        case 4: indexComponentType = TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT;   break;
+    }
     tinygltf::Accessor idxAccessor;
-    idxAccessor.name = "LOD_IndicesAccessor";
+    idxAccessor.name = "LOD_IndexAccessor";
     idxAccessor.bufferView = idxBVIndex;
     idxAccessor.byteOffset = 0;
     idxAccessor.componentType = indexComponentType;
     idxAccessor.count = indexCount;
     idxAccessor.type = TINYGLTF_TYPE_SCALAR;
     idxAccessor.normalized = false;
-
-    // Fill min/max for the indices (optional but nice to have)
-    uint64_t minIdx = std::numeric_limits<uint64_t>::max();
-    uint64_t maxIdx = 0;
-    for (size_t i = 0; i < indexCount; ++i) {
-        uint32_t v = ReadIndexAt(lodMeshData.indices, lodMeshData.indicesStride, i);
-        if (v < minIdx) minIdx = v;
-        if (v > maxIdx) maxIdx = v;
+    // Fill min/max for indices (optional)
+    {
+        uint64_t minIdx = std::numeric_limits<uint64_t>::max();
+        uint64_t maxIdx = 0;
+        for (size_t i = 0; i < indexCount; ++i) {
+            uint32_t v = ReadIndexAt(lodMeshData.indices, lodMeshData.indicesStride, i);
+            if (v < minIdx) minIdx = v;
+            if (v > maxIdx) maxIdx = v;
+        }
+        idxAccessor.minValues = { static_cast<double>(minIdx) };
+        idxAccessor.maxValues = { static_cast<double>(maxIdx) };
     }
-    idxAccessor.minValues = { static_cast<double>(minIdx) };
-    idxAccessor.maxValues = { static_cast<double>(maxIdx) };
-
     const int idxAccessorIndex = static_cast<int>(ioModel.accessors.size());
     ioModel.accessors.push_back(std::move(idxAccessor));
 
-    // Assemble the new primitive:
-    // - Reuse POSITION (and optionally NORMAL, TEXCOORD_0) from the base primitive.
-    // - Point indices to the new accessor.
+    // Assemble primitive with the freshly built accessors
     tinygltf::Primitive prim;
-    prim.mode = TINYGLTF_MODE_TRIANGLES; // assuming triangles; adjust if needed
+    prim.mode = TINYGLTF_MODE_TRIANGLES;
     prim.indices = idxAccessorIndex;
-    prim.attributes["POSITION"] = basePosAccessorIndex;
-    if (normIt != basePrim.attributes.end()) {
-        prim.attributes["NORMAL"] = normIt->second;
+    prim.attributes["POSITION"] = posAccessorIndex;
+    if (normalAccessorIndex >= 0) {
+        prim.attributes["NORMAL"] = normalAccessorIndex;
     }
-    if (uv0It != basePrim.attributes.end()) {
-        prim.attributes["TEXCOORD_0"] = uv0It->second;
+    if (uv0AccessorIndex >= 0) {
+        prim.attributes["TEXCOORD_0"] = uv0AccessorIndex;
     }
-    // Reuse material if base has one.
-    prim.material = basePrim.material;
+    prim.material = reuseMaterial;
 
     outMesh.primitives.push_back(std::move(prim));
 }
