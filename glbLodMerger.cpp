@@ -666,6 +666,163 @@ static void AttachLodsUnderBaseNodes(tinygltf::Model& model,
     }
 }
 
+// Add after includes and before your existing helpers.
+
+// Merge extensionsUsed from src into dst
+static void MergeExtensionsUsed(tinygltf::Model& dst, const tinygltf::Model& src) {
+    for (const auto& e : src.extensionsUsed) {
+        if (std::find(dst.extensionsUsed.begin(), dst.extensionsUsed.end(), e) == dst.extensionsUsed.end()) {
+            dst.extensionsUsed.push_back(e);
+        }
+    }
+}
+
+struct CloneContext {
+    std::vector<int> bufferMap;
+    std::vector<int> bufferViewMap;
+    std::vector<int> accessorMap;
+    std::vector<int> imageMap;
+    std::vector<int> textureMap;
+    std::vector<int> samplerMap;
+    std::vector<int> materialMap;
+};
+
+static int MapBuffer(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.bufferMap.size() <= idx) ctx.bufferMap.resize(idx + 1, -1);
+    if (ctx.bufferMap[idx] >= 0) return ctx.bufferMap[idx];
+    tinygltf::Buffer b = src.buffers[idx];
+    int newIdx = (int)dst.buffers.size();
+    dst.buffers.push_back(std::move(b));
+    ctx.bufferMap[idx] = newIdx;
+    return newIdx;
+}
+
+static int MapBufferView(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.bufferViewMap.size() <= idx) ctx.bufferViewMap.resize(idx + 1, -1);
+    if (ctx.bufferViewMap[idx] >= 0) return ctx.bufferViewMap[idx];
+    tinygltf::BufferView bv = src.bufferViews[idx];
+    bv.buffer = MapBuffer(ctx, src, bv.buffer, dst);
+    int newIdx = (int)dst.bufferViews.size();
+    dst.bufferViews.push_back(std::move(bv));
+    ctx.bufferViewMap[idx] = newIdx;
+    return newIdx;
+}
+
+static int MapAccessor(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.accessorMap.size() <= idx) ctx.accessorMap.resize(idx + 1, -1);
+    if (ctx.accessorMap[idx] >= 0) return ctx.accessorMap[idx];
+    tinygltf::Accessor a = src.accessors[idx];
+    a.bufferView = MapBufferView(ctx, src, a.bufferView, dst);
+    // Map sparse data if present
+    if (a.sparse.isSparse) {
+        a.sparse.indices.bufferView = MapBufferView(ctx, src, a.sparse.indices.bufferView, dst);
+        a.sparse.values.bufferView  = MapBufferView(ctx, src, a.sparse.values.bufferView, dst);
+    }
+    int newIdx = (int)dst.accessors.size();
+    dst.accessors.push_back(std::move(a));
+    ctx.accessorMap[idx] = newIdx;
+    return newIdx;
+}
+
+static int MapSampler(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.samplerMap.size() <= idx) ctx.samplerMap.resize(idx + 1, -1);
+    if (ctx.samplerMap[idx] >= 0) return ctx.samplerMap[idx];
+    tinygltf::Sampler s = src.samplers[idx];
+    int newIdx = (int)dst.samplers.size();
+    dst.samplers.push_back(std::move(s));
+    ctx.samplerMap[idx] = newIdx;
+    return newIdx;
+}
+
+static int MapImage(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.imageMap.size() <= idx) ctx.imageMap.resize(idx + 1, -1);
+    if (ctx.imageMap[idx] >= 0) return ctx.imageMap[idx];
+    tinygltf::Image img = src.images[idx];
+    if (img.bufferView >= 0) {
+        img.bufferView = MapBufferView(ctx, src, img.bufferView, dst);
+        // img.mimeType left as-is
+    }
+    int newIdx = (int)dst.images.size();
+    dst.images.push_back(std::move(img));
+    ctx.imageMap[idx] = newIdx;
+    return newIdx;
+}
+
+static int MapTexture(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.textureMap.size() <= idx) ctx.textureMap.resize(idx + 1, -1);
+    if (ctx.textureMap[idx] >= 0) return ctx.textureMap[idx];
+    tinygltf::Texture t = src.textures[idx];
+    t.source  = MapImage(ctx, src, t.source, dst);
+    t.sampler = MapSampler(ctx, src, t.sampler, dst);
+    int newIdx = (int)dst.textures.size();
+    dst.textures.push_back(std::move(t));
+    ctx.textureMap[idx] = newIdx;
+    return newIdx;
+}
+
+static void RemapTexInfo(CloneContext& ctx, const tinygltf::Model& src, tinygltf::TextureInfo& ti, tinygltf::Model& dst) {
+    ti.index = MapTexture(ctx, src, ti.index, dst);
+}
+static void RemapOccl(CloneContext& ctx, const tinygltf::Model& src, tinygltf::OcclusionTextureInfo& oi, tinygltf::Model& dst) {
+    oi.index = MapTexture(ctx, src, oi.index, dst);
+}
+static void RemapNorm(CloneContext& ctx, const tinygltf::Model& src, tinygltf::NormalTextureInfo& ni, tinygltf::Model& dst) {
+    ni.index = MapTexture(ctx, src, ni.index, dst);
+}
+
+static int MapMaterial(CloneContext& ctx, const tinygltf::Model& src, int idx, tinygltf::Model& dst) {
+    if (idx < 0) return -1;
+    if ((int)ctx.materialMap.size() <= idx) ctx.materialMap.resize(idx + 1, -1);
+    if (ctx.materialMap[idx] >= 0) return ctx.materialMap[idx];
+    tinygltf::Material m = src.materials[idx];
+    RemapTexInfo(ctx, src, m.pbrMetallicRoughness.baseColorTexture, dst);
+    RemapTexInfo(ctx, src, m.pbrMetallicRoughness.metallicRoughnessTexture, dst);
+    RemapNorm(ctx, src, m.normalTexture, dst);
+    RemapOccl(ctx, src, m.occlusionTexture, dst);
+    RemapTexInfo(ctx, src, m.emissiveTexture, dst);
+    int newIdx = (int)dst.materials.size();
+    dst.materials.push_back(std::move(m));
+    ctx.materialMap[idx] = newIdx;
+    return newIdx;
+}
+
+// Clone one mesh from src into dst, returning new mesh index in dst.
+static int CloneMeshWithDependencies(CloneContext& ctx,
+                                     const tinygltf::Model& src,
+                                     int srcMeshIndex,
+                                     tinygltf::Model& dst)
+{
+    if (srcMeshIndex < 0 || srcMeshIndex >= (int)src.meshes.size()) return -1;
+
+    tinygltf::Mesh out = src.meshes[srcMeshIndex];
+    for (auto& prim : out.primitives) {
+        // Remap accessors for attributes
+        for (auto& kv : prim.attributes) {
+            kv.second = MapAccessor(ctx, src, kv.second, dst);
+        }
+        // Indices
+        prim.indices = MapAccessor(ctx, src, prim.indices, dst);
+        // Material
+        prim.material = MapMaterial(ctx, src, prim.material, dst);
+        // Morph targets
+        for (auto& tgt : prim.targets) {
+            for (auto& kv : tgt) kv.second = MapAccessor(ctx, src, kv.second, dst);
+        }
+    }
+    int newIdx = (int)dst.meshes.size();
+    dst.meshes.push_back(std::move(out));
+
+    // Merge extensionsUsed
+    MergeExtensionsUsed(dst, src);
+    return newIdx;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -691,12 +848,19 @@ int main(int argc, char** argv)
     validityCheck(baseMeshData, baseModel, 0);
     // Extract base name without extension
     std::string baseName = std::filesystem::path(baseFile).stem().string();
+    // if we start with a _00 suffix, remove it
+    if (baseName.length() > 3 &&
+        baseName[baseName.length() - 3] == '_' &&
+        isdigit(baseName[baseName.length() - 2]) &&
+        isdigit(baseName[baseName.length() - 1])) {
+        baseName = baseName.substr(0, baseName.length() - 3);
+    }
 
     // Keep track of indices of newly added meshes
     std::vector<int> newMeshIndices;
 
     // Find and merge LOD files
-    for (int i = 1; i <= 1; ++i) {
+    for (int i = 1; i <= 9; ++i) {
         char lodFile[512];
         snprintf(lodFile, sizeof(lodFile), "%s/%s_%02d.glb", lodDir.c_str(), baseName.c_str(), i);
         if (!std::filesystem::exists(lodFile)) continue;
@@ -708,16 +872,28 @@ int main(int argc, char** argv)
             continue;
         }
 
-        // Merge meshes from LOD model into base model
-        for (int meshNum = 0; meshNum < int(lodModel.meshes.size()); ++meshNum) {
-            MeshImportData lodMeshData;
-            importMesh(lodMeshData, lodModel, meshNum);
-            validityCheck(lodMeshData, lodModel, meshNum);
-            tinygltf::Mesh newLodMesh;
-            createLodMesh(baseModel, newLodMesh, lodMeshData, /*baseMeshIndex=*/0, /*basePrimIndex=*/0);
-            if (!newLodMesh.primitives.empty()) {
-                baseModel.meshes.push_back(newLodMesh);
-                newMeshIndices.push_back(static_cast<int>(baseModel.meshes.size() - 1));
+        bool clone = false;
+        if (clone) {
+            // Merge meshes from LOD model into base model by cloning, not re-importing.
+            CloneContext ctx; // persist per LOD file to dedup shared buffers/materials
+            for (int meshNum = 0; meshNum < (int)lodModel.meshes.size(); ++meshNum) {
+                int newIdx = CloneMeshWithDependencies(ctx, lodModel, meshNum, baseModel);
+                if (newIdx >= 0) {
+                    newMeshIndices.push_back(newIdx);
+                }
+            }
+        } else {
+            // Merge meshes from LOD model into base model
+            for (int meshNum = 0; meshNum < int(lodModel.meshes.size()); ++meshNum) {
+                MeshImportData lodMeshData;
+                importMesh(lodMeshData, lodModel, meshNum);
+                validityCheck(lodMeshData, lodModel, meshNum);
+                tinygltf::Mesh newLodMesh;
+                createLodMesh(baseModel, newLodMesh, lodMeshData, /*baseMeshIndex=*/0, /*basePrimIndex=*/0);
+                if (!newLodMesh.primitives.empty()) {
+                    baseModel.meshes.push_back(newLodMesh);
+                    newMeshIndices.push_back(static_cast<int>(baseModel.meshes.size() - 1));
+                }
             }
         }
         
